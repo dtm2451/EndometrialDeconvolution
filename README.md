@@ -3,4 +3,4 @@ This repository is a companion to a study that carefully applies cell type decon
 
 This repository is currenty under construction as the masuscipt is under review. If you use the repository, we ask that you cite the paper in any publications that follow:
 
-Daniel G. Bunis, Wanxin Wang, Júlia Vallvé-Juanico, Sahar Houshdaran, Sushmita Sen, Isam Ben Soltane, Idit Kosti, Kim Chi Vo, Juan Irwin, Linda C. Giudice, Marina Sirota. "Whole-tissue deconvolution and scRNAseq analysis identify altered endometrial cellular compositions and functionality associated with endometriosis", In Press, 2021.
+Daniel G. Bunis*, Wanxin Wang*, Júlia Vallvé-Juanico, Sahar Houshdaran, Sushmita Sen, Isam Ben Soltane, Idit Kosti, Kim Chi Vo, Juan Irwin, Linda C. Giudice, Marina Sirota. "Whole-tissue deconvolution and scRNAseq analysis identify altered endometrial cellular compositions and functionality associated with endometriosis", In Press, 2021.
