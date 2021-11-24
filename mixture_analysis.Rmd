@@ -1,0 +1,536 @@
+---
+title: "mixture_analysis"
+author: "Dan Bunis"
+date: "11/22/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(GEOquery)
+library(affy)
+
+library(dittoSeq)
+library(SingleCellExperiment)
+# BiocManager::install("dviraran/xCell")
+library(xCell)
+library(gridExtra)
+```
+
+This script goes through pulling of microarray data from target GEO datasets, cleaning and trimming to target sorted endometrial cell types' microarray data, then transformation of this data into artificial mixtures, and xCell analysis of these artificial mixtures.
+
+# 1. Pull target microarray data from GEO
+
+```{r figS3}
+# Pull data direct from GEO
+gses <- c("GSE73622", "GSE31152", "GSE48301", "GSE97163")
+geo_data <- lapply(gses, function(x) { getGEO(x) })
+exps <- lapply(seq_along(geo_data), function(x) { exprs(geo_data[[x]][[1]]) })
+
+# All the same platform?
+unique(geo_data[[1]][[1]]$platform_id)
+unique(geo_data[[2]][[1]]$platform_id)
+unique(geo_data[[3]][[1]]$platform_id)
+unique(geo_data[[4]][[1]]$platform_id)
+# Check
+
+# Generate merged matrix
+common <- rownames(exps[[1]])
+common <- common[common %in% rownames(exps[[2]]) & common %in% rownames(exps[[3]]) & common %in% rownames(exps[[4]])]
+exp <- do.call(cbind, lapply(exps, function(x) { x[common,] }))
+
+# Convert probes to symbols
+symb <- fData(geo_data[[1]][[1]])$gene_assignment
+symb <- sapply(symb, function(x) { strsplit(x, split = " // ") })
+symb <- sapply(symb, function(x) { ifelse(length(x)>1, x[2], NA) })
+names(symb) <- fData(geo_data[[1]][[1]])$ID
+
+# Remove NA symbols and replace probe IDs with genes symbols
+symb <- symb[rownames(exp)]
+exp <- exp[!is.na(symb),]
+rownames(exp) <- symb[!is.na(symb)]
+
+# Only the first for any duplicates.
+exp <- exp[unique(match(rownames(exp), rownames(exp))),]
+```
+
+```{r}
+# Load associated sample metadata from original authors
+isolated <- read.csv("refs/DECONVOLUTION_MASTERLIST.csv")
+table(isolated$Cell.type..eSF..Stromal.fibroblast..eMSC..endomtertrial.mesenchymal.stem.cell..EC..Endothelia.cell..eEC..endometrial.Epithelial.cell.)
+
+# And split this by cell type
+iso_EC <- isolated[isolated$Cell.type..eSF..Stromal.fibroblast..eMSC..endomtertrial.mesenchymal.stem.cell..EC..Endothelia.cell..eEC..endometrial.Epithelial.cell. == "EC",]
+iso_eEC <- isolated[isolated$Cell.type..eSF..Stromal.fibroblast..eMSC..endomtertrial.mesenchymal.stem.cell..EC..Endothelia.cell..eEC..endometrial.Epithelial.cell. == "eEC",]
+iso_eMSC <- isolated[isolated$Cell.type..eSF..Stromal.fibroblast..eMSC..endomtertrial.mesenchymal.stem.cell..EC..Endothelia.cell..eEC..endometrial.Epithelial.cell. == "eMSC",]
+iso_eSF <- isolated[isolated$Cell.type..eSF..Stromal.fibroblast..eMSC..endomtertrial.mesenchymal.stem.cell..EC..Endothelia.cell..eEC..endometrial.Epithelial.cell. == "eSF",]
+```
+
+```{r}
+# Convert GEO file names to be similar to 'filename.CEL'
+full_names <- unlist(lapply(geo_data, function(x) { x[[1]]$supplementary_file }))
+names <- sapply(full_names, function(x) {
+    strsplit(x, split = "_")[[1]][2]
+})
+# Add GSM (columns of exp) to names as its names 
+names(full_names) <- colnames(exp)
+names(names) <- colnames(exp)
+
+# Some perhaps heavy cleaning
+names <- gsub(".CEL.gz", "", names)
+names <- gsub(".CEL", "", names)
+names <- gsub("Early", "", names)
+names <- gsub("Late", "", names)
+names <- gsub("FACS", "", names)
+names <- gsub(" ", "", names)
+```
+
+```{r}
+our_names <- isolated$Filename.CEL
+# Add our fullnames as names of our_names
+names(our_names) <- our_names
+
+# Some cleaning
+our_names <- gsub(".CEL", "", our_names)
+our_names <- gsub("FACS", "", our_names)
+our_names <- gsub(" ", "", our_names)
+our_names <- gsub("_", "", our_names)
+```
+
+```{r}
+# "easy" matches
+map <- our_names[(our_names %in% names)]
+match <- match(names(map), isolated$Filename.CEL)
+names(match) <- names(names)[match(map, names)]
+
+sum(!(our_names %in% names))
+(our_names_left <- our_names[!(our_names %in% names)])
+```
+
+34 left.
+
+Now, looks like some may not have their leading numbers
+
+```{r}
+# Some seem to have their leading numbers removed...
+our_names_left_trim <- sapply(our_names_left, function(x){
+    strsplit(x, ".", fixed = TRUE)[[1]]
+})
+our_names_left_trim <- sapply(our_names_left_trim, function(x){
+    x[length(x)]
+})
+names(our_names_left_trim) <- names(our_names_left)
+
+# Determine length of what's now remaining
+sum(!(our_names_left_trim %in% names))
+
+# Translate
+map <- our_names_left_trim[(our_names_left_trim %in% names)]
+match2 <- match(names(map), isolated$Filename.CEL)
+names(match2) <- names(names)[match(map, names)]
+
+table(c(match, match2))
+
+(our_names_left <- our_names[-1*(c(match,match2))])
+```
+
+23 left.
+
+Now, seems some done't have their EpCAM.
+
+```{r}
+# Explore next set...
+names[grep("PC07", names)]
+names[grep("PC08", names)]
+
+# Seems removal of "EpCAM" can get some more...
+our_names_left_trim <- gsub("EpCAM", "", our_names_left)
+
+sum(!(our_names_left_trim %in% names))
+
+map <- our_names_left_trim[(our_names_left_trim %in% names)]
+match3 <- match(names(map), isolated$Filename.CEL)
+names(match3) <- names(names)[match(map, names)]
+
+table(c(match, match2, match3))
+
+(our_names_left <- our_names[-1*(c(match,match2,match3))])
+```
+
+16 left.
+
+Some remaining have a _ before the +/- section
+
+```{r}
+# Explore next set
+names[grep("ETB60|ETB61|ETB65|ETB67|ETB74", names)]
+
+# These ones are overly trimmed on the GEO side
+full_names[grep("ETB60|ETB61|ETB65|ETB67|ETB74", names)]
+
+# There was an extra "_" in these names.
+our_names_left_trim <- gsub("++", "_++", our_names_left, fixed = TRUE)
+our_names_left_trim <- gsub("+-", "_+-", our_names_left_trim, fixed = TRUE)
+our_names_left_trim <- gsub("-+", "_-+", our_names_left_trim, fixed = TRUE)
+our_names_left_trim <- gsub("--", "_--", our_names_left_trim, fixed = TRUE)
+
+sum(!(sapply(our_names_left_trim, function(x) { any(grepl(x,full_names, fixed = TRUE)) })))
+# Gets all the rest!
+
+map <- our_names_left_trim
+match4 <- match(names(map), isolated$Filename.CEL)
+names(match4) <- names(names)[sapply(map, function(x) { grep(x, full_names, fixed = TRUE)[1] })]
+
+table(c(match, match2, match3, match4))
+```
+
+0 left! ??
+
+```{r}
+# CHECK:
+any(table(names(c(match, match2, match3, match4))) != 1)
+any(table(c(match, match2, match3, match4)) != 1)
+```
+
+WONDERFUL!
+
+```{r}
+TAKE <- c(match, match2, match3, match4)
+```
+
+--------------------------
+
+# 2. Select only target sorted cell data
+
+Just need the filenames because we will use the raw .CEL files.
+
+```{r}
+CELfiles <- full_names[names(TAKE)]
+CELfiles <- sapply(CELfiles, function(x) {strsplit(x, split = "/suppl/")[[1]][2]})
+```
+
+```{r}
+# Cut into tissues!
+EC_CEL <- CELfiles[isolated$Cell.type..eSF..Stromal.fibroblast..eMSC..endomtertrial.mesenchymal.stem.cell..EC..Endothelia.cell..eEC..endometrial.Epithelial.cell.[TAKE]=="EC"]
+eEC_CEL <- CELfiles[isolated$Cell.type..eSF..Stromal.fibroblast..eMSC..endomtertrial.mesenchymal.stem.cell..EC..Endothelia.cell..eEC..endometrial.Epithelial.cell.[TAKE]=="eEC"]
+eMSC_CEL <- CELfiles[isolated$Cell.type..eSF..Stromal.fibroblast..eMSC..endomtertrial.mesenchymal.stem.cell..EC..Endothelia.cell..eEC..endometrial.Epithelial.cell.[TAKE]=="eMSC"]
+eSF_CEL <- CELfiles[isolated$Cell.type..eSF..Stromal.fibroblast..eMSC..endomtertrial.mesenchymal.stem.cell..EC..Endothelia.cell..eEC..endometrial.Epithelial.cell.[TAKE]=="eSF"]
+```
+
+Final Check...
+Seemed that the first of the eSF files is grabbing from an incorrect ETB99-+ file.
+
+Otherwise, they seem to match up!
+
+```{r}
+etb99 <- full_names[grep("ETB99", full_names)]
+etb99
+
+# We actually need the 1st (and 5th) of these, but currently had the 4th (and 5th)
+eSF_CEL[1]
+eSF_CEL[1] <- strsplit(etb99[1], split = "/suppl/")[[1]][2]
+
+eSF_CEL
+```
+
+# 3. Read in and normalize.
+
+I downloaded the RAW CEL files for each GSE into a single folder, then...
+
+```{r}
+#Download from http://brainarray.mbni.med.umich.edu/Brainarray/Database/CustomCDF/CDF_download.asp
+#Select ENTREZG than dowload and install hugene10st (A and C) which are proper for these data
+library(hugene10sthsentrezg.db)
+
+CEL_dir <- "GEO Data/purified_raw_GEO/All_GSMs/"
+
+load_and_justRMA_to_exprs <- function(cel_targs, dir) {
+    
+    cel_locations <- paste0(dir, cel_targs)
+    eset <- justRMA(
+        filenames = cel_locations,
+        cdfname = "hugene10sthsentrezgcdf",
+        normalize = TRUE,
+        background = TRUE,
+        verbose = TRUE)
+    exprs(eset)
+}
+```
+
+```{r}
+exp_EC <- load_and_justRMA_to_exprs(EC_CEL, dir = CEL_dir)
+exp_eEC <- load_and_justRMA_to_exprs(eEC_CEL, dir = CEL_dir)
+exp_eMSC <- load_and_justRMA_to_exprs(eMSC_CEL, dir = CEL_dir)
+exp_eSF <- load_and_justRMA_to_exprs(eSF_CEL, dir = CEL_dir)
+```
+
+# 4. Create Cell Type References (median expression)
+
+```{r}
+# Convert to Symbols
+symbol_and_trim <- function(exp, targ = hugene10sthsentrezgSYMBOL) {
+    symbs <- rows.to.symbol(exp, trim.na = FALSE, targ = targ)
+    exp <- exp[!is.na(symbs),]
+    rownames(exp) <- symbs[!is.na(symbs)]
+    
+    exp
+}
+
+exp_EC <- symbol_and_trim(exp_EC)
+exp_eEC <- symbol_and_trim(exp_eEC)
+exp_eMSC <- symbol_and_trim(exp_eMSC)
+exp_eSF <- symbol_and_trim(exp_eSF)
+```
+
+```{r}
+# Create median signatures
+EC_median <- apply(exp_EC, MARGIN = 1, median)
+eEC_median <- apply(exp_eEC, MARGIN = 1, median)
+eMSC_median <- apply(exp_eMSC, MARGIN = 1, median)
+eSF_median <- apply(exp_eSF, MARGIN = 1, median)
+```
+
+# 5. Create Mixtures
+
+```{r}
+mixes <- data.frame(
+    End90 = EC_median * 0.9 + eEC_median * .1/3 + eMSC_median * .1/3 + eSF_median * .1/3,
+    End70 = EC_median * 0.7 + eEC_median * .3/3 + eMSC_median * .3/3 + eSF_median * .3/3,
+    End50 = EC_median * 0.5 + eEC_median * .5/3 + eMSC_median * .5/3 + eSF_median * .5/3,
+    End30 = EC_median * 0.3 + eEC_median * .7/3 + eMSC_median * .7/3 + eSF_median * .7/3,
+    End10 = EC_median * 0.1 + eEC_median * .9/3 + eMSC_median * .9/3 + eSF_median * .9/3,
+    Epi90 = EC_median * .1/3 + eEC_median * 0.9 + eMSC_median * .1/3 + eSF_median * .1/3,
+    Epi70 = EC_median * .3/3 + eEC_median * 0.7 + eMSC_median * .3/3 + eSF_median * .3/3,
+    Epi50 = EC_median * .5/3 + eEC_median * 0.5 + eMSC_median * .5/3 + eSF_median * .5/3,
+    Epi30 = EC_median * .7/3 + eEC_median * 0.3 + eMSC_median * .7/3 + eSF_median * .7/3,
+    Epi10 = EC_median * .9/3 + eEC_median * 0.1 + eMSC_median * .9/3 + eSF_median * .9/3,
+    MSC90 = EC_median * .1/3 + eEC_median * .1/3 + eMSC_median * 0.9 + eSF_median * .1/3,
+    MSC70 = EC_median * .3/3 + eEC_median * .3/3 + eMSC_median * 0.7 + eSF_median * .3/3,
+    MSC50 = EC_median * .5/3 + eEC_median * .5/3 + eMSC_median * 0.5 + eSF_median * .5/3,
+    MSC30 = EC_median * .7/3 + eEC_median * .7/3 + eMSC_median * 0.3 + eSF_median * .7/3,
+    MSC10 = EC_median * .9/3 + eEC_median * .9/3 + eMSC_median * 0.1 + eSF_median * .9/3,
+    Fib90 = EC_median * .1/3 + eEC_median * .1/3 + eMSC_median * .1/3 + eSF_median * 0.9,
+    Fib70 = EC_median * .3/3 + eEC_median * .3/3 + eMSC_median * .3/3 + eSF_median * 0.7,
+    Fib50 = EC_median * .5/3 + eEC_median * .5/3 + eMSC_median * .5/3 + eSF_median * 0.5,
+    Fib30 = EC_median * .7/3 + eEC_median * .7/3 + eMSC_median * .7/3 + eSF_median * 0.3,
+    Fib10 = EC_median * .9/3 + eEC_median * .9/3 + eMSC_median * .9/3 + eSF_median * 0.1
+)
+
+mix_meta <- data.frame(
+    End_in = c(0.9, 0.7, 0.5, 0.3, 0.1,
+                   .1/3, .3/3, .5/3, .7/3, .9/3,
+                   .1/3, .3/3, .5/3, .7/3, .9/3,
+                   .1/3, .3/3, .5/3, .7/3, .9/3),
+    Epi_in = c(.1/3, .3/3, .5/3, .7/3, .9/3,
+                   0.9, 0.7, 0.5, 0.3, 0.1,
+                   .1/3, .3/3, .5/3, .7/3, .9/3,
+                   .1/3, .3/3, .5/3, .7/3, .9/3),
+    MSC_in = c(.1/3, .3/3, .5/3, .7/3, .9/3,
+                  .1/3, .3/3, .5/3, .7/3, .9/3,
+                  0.9, 0.7, 0.5, 0.3, 0.1,
+                  .1/3, .3/3, .5/3, .7/3, .9/3),
+    Fib_in = c(.1/3, .3/3, .5/3, .7/3, .9/3,
+                  .1/3, .3/3, .5/3, .7/3, .9/3,
+                  .1/3, .3/3, .5/3, .7/3, .9/3,
+                  0.9, 0.7, 0.5, 0.3, 0.1),
+    Adj = rep(c("End", "Epi", "MSC", "Fib"), each = 5)
+    )
+ 
+rownames(mixes) <- rownames(exp_EC)
+```
+
+# 6. Run xCell with and without spillover step
+
+```{r}
+# Pick Cell Types (ALL)
+cell.types <- colnames(xCell.data$spill.array$K)
+```
+
+1. No spillover
+
+```{r}
+# Run xCell on all of these (no spillOver step)
+# (FYI Warning to others: This function hard-codes some inputs left to the user in xCellAnalysis.)
+xCell_no_spill <- function(expr, cell.types.use) {
+  # 1. Runs the rawEnrichmentAnalysis and transformScores steps of xCell with microarray + default parameterization
+  # 2. Trims the rows of the output to cells of cell.types.use
+  
+  xCell_raw <- rawEnrichmentAnalysis(
+    expr = expr,
+    # Filling in based on code of xCellAnalysis
+    signatures = xCell.data$signatures,
+    genes = xCell.data$genes
+  )
+  xCell_transformed <- transformScores(
+    scores = xCell_raw,
+    fit.vals = xCell.data$spill.array$fv,
+    scale = TRUE
+  )
+  
+  xCell_transformed[cell.types.use,]
+}
+
+# Run xCell on all mixes
+xCell_mixes <- xCell_no_spill(
+	expr = mixes,
+	cell.types.use = cell.types)
+# Convert to SCE for dittoHeatmap
+xCell_mixes_sce <- importDittoBulk(
+    list(counts = xCell_mixes),
+    metadata = mix_meta)
+xCell_mixes_sce$SpillOver <- "off"
+```
+
+2. With spillover
+
+```{r}
+# Run xCell on all mixes
+xCell_mixes_with_comp <- xCellAnalysis(
+	expr = mixes,
+	rnaseq = FALSE,
+	cell.types.use = cell.types)
+# Convert to SCE for dittoHeatmap
+xCell_mixes_sce_with_comp <- importDittoBulk(
+    list(counts = xCell_mixes_with_comp),
+    metadata = mix_meta)
+colnames(xCell_mixes_sce_with_comp) <- paste0(colnames(xCell_mixes_sce), "_comp")
+xCell_mixes_sce_with_comp$SpillOver <- "on"
+```
+
+# 7. Analysis / Figure creation
+
+```{r}
+xCell_mixes_sce_combined <- cbind(xCell_mixes_sce_with_comp, xCell_mixes_sce)
+```
+
+```{r, fig.width = 4, fig.height = 3, eval=FALSE}
+# Heatmap
+hm <- dittoHeatmap(
+    object = xCell_mixes_sce,
+    genes = c(
+      "Endothelial cells",
+      "Epithelial cells",
+      "MSC",
+      "Fibroblasts"),
+    show_colnames = TRUE,
+    fontsize_row = 7,
+    show_rownames = TRUE,
+    scaled.to.max = TRUE,
+    cluster_cols = FALSE,
+    cluster_rows = FALSE,
+    complex = TRUE,
+    main = "SpillOver: Off",
+    annot.by = c("Fib_in", "MSC_in", "Epi_in", "End_in"),
+    annot.colors = c("grey30","grey30","grey30", "grey30"))
+
+hm_comp <- dittoHeatmap(
+    object = xCell_mixes_sce_with_comp,
+    genes = c(
+      "Endothelial cells",
+      "Epithelial cells",
+      "MSC",
+      "Fibroblasts"),
+    show_colnames = TRUE,
+    fontsize_row = 7,
+    show_rownames = TRUE,
+    scaled.to.max = TRUE,
+    cluster_cols = FALSE,
+    cluster_rows = FALSE,
+    complex = TRUE,
+    main = "SpillOver: On",
+    annot.by = c("Fib_in", "MSC_in", "Epi_in", "End_in"),
+    annot.colors = c("grey30","grey30","grey30", "grey30"))
+
+# Scatterplots
+x <- dittoScatterPlot(xCell_mixes_sce_combined,
+    x.var = "Epi_in",
+    y.var = "Epithelial cells",
+    color.var = "SpillOver",
+    color.panel = c("black", "grey70"),
+    ylab = "Epithelial cells",
+    legend.show = FALSE,
+    main = "ES: Enrichment Scores",
+    data.out = TRUE)
+p1 <- x$plot +
+    geom_smooth(data = x$Target_data,
+        mapping = aes(x = X, y = Y, color = color),
+        method = "lm",
+        se = FALSE) +
+    theme(aspect.ratio = 1)
+
+x <- dittoScatterPlot(xCell_mixes_sce_combined,
+    x.var = "End_in",
+    y.var = "Endothelial cells",
+    color.var = "SpillOver",
+    color.panel = c("black", "grey70"),
+    ylab = "Endothelial cells",
+    legend.show = FALSE,
+    main = "",
+    data.out = TRUE)
+p2 <- x$plot +
+    geom_smooth(data = x$Target_data,
+        mapping = aes(x = X, y = Y, color = color),
+        method = "lm",
+        se = FALSE) +
+    theme(aspect.ratio = 1)
+
+x <- dittoScatterPlot(xCell_mixes_sce_combined,
+    x.var = "MSC_in",
+    y.var = "MSC",
+    color.var = "SpillOver",
+    color.panel = c("black", "grey70"),
+    ylab = "MSC",
+    legend.show = FALSE,
+    main = "",
+    data.out = TRUE)
+p3 <- x$plot +
+    geom_smooth(data = x$Target_data,
+        mapping = aes(x = X, y = Y, color = color),
+        method = "lm",
+        se = FALSE) +
+    theme(aspect.ratio = 1)
+
+x <- dittoScatterPlot(xCell_mixes_sce_combined,
+    x.var = "Fib_in",
+    y.var = "Fibroblasts",
+    color.var = "SpillOver",
+    color.panel = c("black", "grey70"),
+    ylab = "Fibroblasts",
+    legend.show = FALSE,
+    main = "",
+    data.out = TRUE)
+p4 <- x$plot +
+    geom_smooth(data = x$Target_data,
+        mapping = aes(x = X, y = Y, color = color),
+        method = "lm",
+        se = FALSE) +
+    theme(aspect.ratio = 1)
+
+
+pdf("figures/Fig2_cd_xCell_mixture_check.pdf", w = 8, h = 6)
+grid.arrange(
+    grobs = list(grid::grid.grabExpr(ComplexHeatmap::draw(hm)),
+                 p1, p2, p3, p4),
+    layout_matrix = t(matrix(nrow = 4,
+        data = c(
+            2,3,4,5,
+            2,3,4,5,
+            1,1,1,1,
+            1,1,1,1,
+            1,1,1,1
+        )))
+)
+dev.off()
+
+pdf("figures/Fig2_c_scatter_legend.pdf", w = 2, h = 2)
+dittoSeq:::.grab_legend(dittoScatterPlot(xCell_mixes_sce_combined,
+    x.var = "Epi_in",
+    y.var = "Epithelial cells",
+    color.var = "SpillOver",
+    legend.color.title = "SpillOver:",
+    legend.color.size = 3,
+    theme = theme_bw() + theme(legend.position = "bottom"),
+    color.panel = c("black", "grey70"),
+    ylab = "Epithelial cells"))
+dev.off()
+```

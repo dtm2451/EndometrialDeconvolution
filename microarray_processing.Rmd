@@ -1,0 +1,759 @@
+---
+title: "From Raw to DE"
+author: "Dan Bunis"
+date: "11/22/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.height = 3, fig.width = 4.5)
+# BiocManager::install("dittoSeq")
+library(dittoSeq)
+library(SingleCellExperiment)
+# Upload and install via Tools > Install Packages...
+# hgu133plus2hsentrezg.db_24.0.0.tar.gz
+# hgu133plus2hsentrezgcdf_24.0.0.tar.gz
+library(hgu133plus2hsentrezg.db)
+library(limma)
+library(ggpubr)
+library(gridExtra)
+library(affy)
+library(sva)
+library(UpSetR)
+# BiocManager::install("pvca")
+library(pvca)
+library(fgsea)
+
+#Install from github
+# BiocManager::install("dviraran/xCell")
+library(xCell)
+```
+
+# Data Preparation, Batch Correction, xCell Output, Background Permutation, and Differential Analyses 
+
+### Some functions to be utilized
+
+```{r}
+#############################################
+### Utility functions
+#############################################
+
+# Convert rows to SYMBOLs
+rows.to.symbol <- function(gene.table, trim.na = TRUE, targ = hgu133plus2hsentrezgSYMBOL) {
+	# 1. Extracts rownames from a gene table
+	# 2. Converts them from probe id to first symbol
+	# 3. Warns about any NAs, trims them when 'trim.na = TRUE'
+	x <- targ
+	x <- as.data.frame( x[ mappedkeys(x) ] )
+	symbols <- x$symbol[ match( rownames(gene.table), x$probe_id ) ]
+	
+	if(any(is.na(symbols))) {
+		message(
+			sum(is.na(symbols)),
+			" symbols gave NA."
+		)
+		if (trim.na) {
+			symbols <- symbols[!is.na(symbols)]
+		}
+	}
+	
+	symbols
+}
+```
+
+# 1. Load data and cleaned metadata
+
+```{r}
+dir <- "CEL_files/"
+cel_files <- paste0(dir,list.files(dir))
+sm <- read.csv("raw_inputs/metadata_of_cels_used__cleaned.csv")
+```
+
+Describe sample stats:
+
+```{r}
+table(sm$lab, sm$phase)
+table(sm$lab, sm$disease)
+table(sm$lab, sm$stage)
+table(sm$phase, sm$stage)
+table(sm$pathology, sm$disease)
+table(sm$stage, sm$disease)
+table(sm$severity, sm$disease)
+```
+
+# 2. Read in and normalize the the expression data
+
+```{r}
+eset <- justRMA(
+    filenames = cel_files,
+    cdfname = "hgu133plus2hsentrezgcdf",
+    normalize = TRUE,
+    background = TRUE,
+    verbose = TRUE)
+exp <- exprs(eset)
+
+# Ensure same ordering of expression matrix and metadata samples.
+sm <- sm[match(colnames(exp), sm$title),]
+rownames(sm) <- colnames(exp)
+```
+
+# 3. Batch Correction with ComBat
+
+1. Correct for lab while protecting for stage and phase.
+
+```{r}
+# Correct for lab
+batch <- as.factor(sm$lab)
+mod <- model.matrix(~stage + phase, data=sm) 
+cb.exp <- ComBat(as.matrix(exp), batch, mod)
+```
+
+2. Create SCEs and visualize with dittoSeq 
+
+```{r}
+# Before batch
+ALL.nb <- importDittoBulk(
+	list(counts = exp),
+	metadata = sm)
+ALL.nb <- addPrcomp(
+	prcomp(t(assay(ALL.nb)), center = TRUE, scale = TRUE),
+	object = ALL.nb,)
+ALL.nb
+```
+
+```{r}
+# After batch
+ALL <- importDittoBulk(
+	list(counts = cb.exp),
+	metadata = sm)
+ALL <- addPrcomp(
+	prcomp(t(assay(ALL)), center = TRUE, scale = TRUE),
+	object = ALL,)
+ALL
+```
+
+```{r, fig.height= 16, fig.width = 8}
+CombatPlots <- multi_dittoDimPlot(
+	ALL,
+	vars = c("lab", "disease", "phase", "stage"),
+	OUT.List = TRUE,
+	legend.show = TRUE,
+	size = 2,
+	axes.labels.show = TRUE,
+	sub = "After Combat Correction")
+NoBatchPlots <- multi_dittoDimPlot(
+	ALL.nb,
+	c("lab", "disease", "phase", "stage"),
+	OUT.List = TRUE,
+	legend.show = TRUE,
+	size = 2,
+	axes.labels.show = TRUE,
+	sub = "No Batch Correction")
+combined <- c(sapply(
+	seq_along(CombatPlots),
+	function(x) c(NoBatchPlots[x], CombatPlots[x])))
+gridExtra::grid.arrange(grobs = combined, ncol = 2)
+```
+
+3. Assess with PVCA
+
+```{r}
+# Prep data
+sm2 <- sm[,c(2:4,7,9)]
+for (i in seq_along(names(sm2))) {
+	sm2[,i] <- as.factor(sm2[,i])
+}
+
+# Make Expression Sets
+ALL.ES <- ExpressionSet(cb.exp, phenoData = AnnotatedDataFrame(sm2))
+ALL.ES.nb <- ExpressionSet(as.matrix(exp), phenoData = AnnotatedDataFrame(sm2))
+
+# Run!
+batch.factors <- c("lab", "phase", "stage")
+pvca <- pvcaBatchAssess(ALL.ES, batch.factors, threshold = 0.1)
+pvca.nb <- pvcaBatchAssess(ALL.ES.nb, batch.factors, threshold = 0.1)
+```
+
+```{r}
+labs <- factor(pvca$label, levels = pvca$label[c(6, 2, 3, 5, 1, 4, 7)])
+
+df <- data.frame(
+	vals = round(pvca$dat[1,],3),
+	Effects = labs)
+df.nb <- data.frame(
+	vals = round(pvca.nb$dat[1,],3),
+	Effects = labs)
+
+pdf("figures/FigS1_b_PVCA_before.pdf", w = 6, h = 4)
+ggplot(df.nb, aes(x = Effects, y = vals)) +
+	ylab("Weighted average proportion variance") +
+	ggtitle("PVCA estimation bar chart", sub = "No batch correction") +
+	geom_col(fill = dittoColors()[2]) +
+	theme_classic() +
+	theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust =1)) +
+	coord_cartesian(ylim = c(0,0.35))
+dev.off()
+pdf("figures/FigS1_b_PVCA_after.pdf", w = 6, h = 4)
+ggplot(df, aes(x = Effects, y = vals)) +
+	ylab("Weighted average proportion variance") +
+	ggtitle("PVCA estimation bar chart", sub = "Batch correction with ComBat") +
+	geom_col(fill = dittoColors()[2]) +
+	theme_classic() +
+	theme(axis.text.x = element_text(angle = 45, hjust = 1, vjust =1)) +
+	coord_cartesian(ylim = c(0,0.35))
+dev.off()
+```
+
+# 4. Run xCell
+
+1. Pick celltypes to start with = ALL signatures
+
+```{r}
+cell.types <- colnames(xCell.data$spill.array$K)
+```
+
+2. Set rownames to symbols
+
+```{r}
+symbs <- rows.to.symbol(exp, trim.na = FALSE)
+exp <- exp[!(is.na(symbs)),]
+rownames(exp) <- rows.to.symbol(exp)
+```
+
+3. Create function for running xCell without the spillover step
+
+```{r}
+xCell_no_spill <- function(expr, cell.types.use) {
+  # 1. Runs the rawEnrichmentAnalysis and transformScores steps of xCell with microarray + default parameterization
+  # 2. Trims the rows of the output to cells of cell.types.use
+  
+  xCell_raw <- rawEnrichmentAnalysis(
+    expr = expr,
+    # Filling in based on code of xCellAnalysis
+    signatures = xCell.data$signatures,
+    genes = xCell.data$genes
+  )
+  xCell_transformed <- transformScores(
+    scores = xCell_raw,
+    fit.vals = xCell.data$spill.array$fv,
+    scale = TRUE
+  )
+  
+  xCell_transformed[cell.types.use,]
+}
+```
+
+3. Use 1000x permutations of gene names to identify cell types giving "real results"
+
+```{r xCell iteration, results = "hide", eval = FALSE}
+### Generate background distributions
+iterateGeneNames_xCell <- function(exp, iterations = 1000) {
+    
+    # Make xCell outputs for 1000-fold iterations of permuting gene symbols
+    xCell_iters <- lapply(
+        seq_len(iterations),
+        function(iter){
+            # Randomize rownames
+            set.seed(1+iter*10000)
+            exp_iter <- exp
+            rownames(exp_iter) <- sample(x = rownames(exp), size = nrow(exp), replace = FALSE)
+            
+            # Run (and output) xCell
+            xCell_no_spill(
+            	expr = exp_iter,
+            	cell.types.use = cell.types)
+        })
+    
+    xCell_iters
+}
+
+xCell_iters <- iterateGeneNames_xCell(exp)
+```
+
+4. Run xCell with all potential cell types
+
+```{r allcell xCell}
+# Run xCell
+xCell_out <- xCell_no_spill(
+	expr = exp,
+	cell.types.use = cell.types)
+```
+
+5. Create SCEs for dittoSeq visualization compatibility and save for later.
+
+```{r}
+# Make an SCE for dittoSeq and normalize through heaatmaply::percentize
+ALL.cells <- importDittoBulk(
+	list(counts = xCell_out),
+	metadata = getMetas(ALL,names.only = FALSE))
+assay(ALL.cells, "normcounts") <- t(heatmaply::percentize(t(assay(ALL.cells))))
+```
+
+6. Trim to cells where median score is above 90th quantile of background for any phase in cases or controls.
+
+```{r}
+# Trim xCell SCE for control/disease samples
+ALL.cells_control <- ALL.cells[,!ALL.cells$disease]
+ALL.cells_disease <- ALL.cells[,ALL.cells$disease]
+
+# Control BG Selection data
+xCell_iters_control <- lapply(
+    xCell_iters,
+    function(x) {
+        x[,!ALL$disease]
+    })
+
+# Disease BG Selection data
+xCell_iters_disease <- lapply(
+    xCell_iters,
+    function(x) {
+        x[,ALL$disease]
+    })
+```
+
+```{r}
+make_BG_calls_per_phase <- function(xCell, BGiters, quantile, phase_calls = ALL$phase) {
+    # quantile should be [0,1]
+
+    trim_iters_to_phase <- function(iters_list, phase) {
+        iters_list <- lapply(
+            iters_list,
+            function(x) x[, phase_calls == phase])
+    }
+
+    # For a set per-phase slice of the data...
+    determine_passing_cells <- function(xCell, iters_list, quantile) {
+
+        # Extract median per cell type per iteration
+        BGmedians <- data.frame(row.names = rownames(iters_list[[1]]))
+        for (iter in seq_along(iters_list)) {
+            BGmedians <- cbind(BGmedians,
+                  apply(iters_list[[iter]], 1, median))
+        }
+
+        # Determine the cutoffs = for each cell type, = quantile of per-iteration-medians
+        BG_vals <- apply(BGmedians, 1,
+              function(x) quantile(x, probs = quantile, names = FALSE))
+
+        # Extract median of 'true' data
+        xCell_meds <- apply(xCell, 1, median)
+
+        # Determine cells that meet the cutoff
+        rownames(xCell)[xCell_meds > BG_vals]
+    }
+
+    return <- lapply(unique(phase_calls), function (this_phase) {
+        print(this_phase)
+        # 1. Trim the xCell output to just the current phase
+        xCell_phase <- xCell[,phase_calls == this_phase]
+        dim(xCell_phase)
+
+        # 2. Trim the iterations to just the current phase
+        iters_phase <- trim_iters_to_phase(BGiters, this_phase)
+        print(paste(
+          "iters dim per run:",
+          nrow(iters_phase[[1]]),
+          ncol(iters_phase[[1]]),
+          "number of iters",
+          length(iters_phase)))
+
+        # 3. Determine celltypes that are above the background
+        determine_passing_cells(xCell_phase, iters_phase, quantile)
+    })
+    names(return) <- unique(phase_calls)
+    
+    return
+}
+
+# Calculate
+BG90_control <- make_BG_calls_per_phase(
+  xCell = counts(ALL.cells_control),
+  BGiters = xCell_1000_control,
+  quantile = 0.90,
+  phase_calls = ALL.cells_control$phase)
+BG90_disease <- make_BG_calls_per_phase(
+  xCell = counts(ALL.cells_disease),
+  BGiters = xCell_1000_disease,
+  quantile = 0.90,
+  phase_calls = ALL.cells_disease$phase)
+
+# View
+BG90_control
+BG90_disease
+```
+
+```{r}
+names(BG90_control) <- paste0("control_",names(BG90_control))
+names(BG90_disease) <- paste0("disease_",names(BG90_disease))
+pdf("figures/permutation_upset.pdf", w = 7, h = 6)
+upset(
+    fromList(c(BG90_control, BG90_disease)),
+    order.by = c("freq"),
+    decreasing = TRUE, nsets = 6, nintersects = 100
+    )
+dev.off()
+```
+
+7. And now we'll retain only these cells in our SCE containing xCell data, and make this into an SCE for dittoSeq and keeping its eventual PCA together.
+
+```{r}
+ALL.cells_90 <- ALL.cells[unique(c(unlist(BG90_control), unlist(BG90_disease))),]
+assay(ALL.cells_90, "normcounts") <- t(heatmaply::percentize(t(assay(ALL.cells_90))))
+
+# Add PCA
+ALL.cells_90 <- dittoSeq::addPrcomp(
+	prcomp(t(assay(ALL.cells_90)), center = TRUE, scale = TRUE),
+	object = ALL.cells_90)
+
+ALL.cells_90
+```
+
+# 5. Save these processed outputs
+
+```{r}
+# Expression SCE, batch corrected
+saveRDS(ALL, file = "processed_data/exp.rds")
+# Expression SCE, no batch correction
+saveRDS(ALL.nb, file = "processed_data/exp_before_combat.rds")
+
+# All xCell enrichment scores in SCE
+saveRDS(ALL.cells, file = "processed_data/xCell.rds")
+# xCell enrichment scores in SCE, only permutation-passing signatures
+saveRDS(ALL.cells_90, file = "processed_data/xCell_BGtrim.rds")
+
+# Permuted background iterations (list of xCell output matrices)
+saveRDS(xCell_iters, file = "processed_data/BG_xCell_1000iterations.rds")
+```
+
+# 6. Differential Gene Expression (DGE) and Pathway Analysis
+
+```{r}
+# Quick fixes to enforce some predictable factor ordering
+ALL$disease <- factor(ALL$disease, levels = c(TRUE, FALSE), labels = c("Disease", "Control"))
+ALL.nb$disease <- factor(ALL.nb$disease, levels = c(TRUE, FALSE), labels = c("Disease", "Control"))
+ALL.cells$disease <- factor(ALL.cells$disease, levels = c(TRUE, FALSE), labels = c("Disease", "Control"))
+
+ALL$phase <- factor(ALL$phase, levels = c("PE", "ESE", "MSE"))
+ALL.nb$phase <- factor(ALL.nb$phase, levels = c("PE", "ESE", "MSE"))
+ALL.cells$phase <- factor(ALL.cells$phase, levels = c("PE", "ESE", "MSE"))
+```
+
+```{r}
+DE_per_phase <- function(
+	sce, ident.1, ident.2, model = ~ phase, pcut = 0.05, fccut = log2(2)) {
+    # Output is a dataframe of DE by phases 'ident.1' versus 'ident.2'.
+    #
+    # Limma is used to apply a linear model to the data, then perform the differential expression calculation.
+    # 'model' is the linear model of metadata column names (or combinations) to use for calculating that linear model.
+    #
+    # 'pcut' and 'fccut' are the DE cutoffs.
+	
+    # Set potential model components to factors
+    phase <- as.factor(sce$phase)
+    stage <- as.factor(sce$stage)
+    
+    # Set the ordering of the phase factor levels to put ident.1 first and ident.2 second.
+    phase <- factor(phase,
+        levels = c(ident.1, ident.2,
+                   levels(phase)[!(levels(phase) %in% c(ident.1, ident.2))]))
+    
+    # Set up for Limma DE
+    design <- model.matrix(model, data = data.frame(stage = stage, phase = phase))
+    rownames(design) <- colnames(sce)
+    fit <- lmFit(counts(sce), design)
+    fit <- eBayes(fit, robust = T)
+    
+    # Extract limma topTable with FDR adjustment and logFC sorting
+    gtable <- topTable(fit, coef=2, adjust = "BH", number = Inf, sort.by = 'logFC')
+    
+    # Trim by 'pcut' and 'fccut'
+    gtable <- gtable[gtable$adj.P.Val < pcut,]
+    gtable <- gtable[abs(gtable$logFC) > fccut,]
+    
+    gtable
+}
+
+DE_per_stage <- function(
+    sce, ident.1, ident.2, model = ~ stage, pcut = 0.05, fccut = log2(2)) {
+    # Output is a dataframe of DE by stages 'ident.1' versus 'ident.2'.
+    #
+    # Limma is used to apply a linear model to the data, then perform the differential expression calculation.
+    # 'model' is the linear model of metadata column names (or combinations) to use for calculating that linear model.
+    #
+    # 'pcut' and 'fccut' are the DE cutoffs.
+	
+    # Set potential model components to factors
+    stage <- as.factor(sce$stage)
+    phase <- as.factor(sce$phase)
+    
+    # Set the ordering of the phase factor levels to put ident.1 first and ident.2 second.
+    stage <- factor(stage,
+        levels = c(ident.1, ident.2,
+                   levels(stage)[!(levels(stage) %in% c(ident.1, ident.2))]))
+    
+    # Set up for Limma DE
+    design <- model.matrix(model, data = data.frame(stage = stage, phase = phase))
+    rownames(design) <- colnames(sce)
+    fit <- lmFit(counts(sce), design)
+    fit <- eBayes(fit, robust = T)
+    
+    # Extract limma topTable with FDR adjustment and logFC sorting
+    gtable <- topTable(fit, coef=2, adjust = "BH", number = Inf, sort.by = 'logFC')
+    
+    # Trim by 'pcut' and 'fccut'
+    gtable <- gtable[gtable$adj.P.Val<pcut,]
+    gtable <- gtable[abs(gtable$logFC) > fccut,]
+    
+    gtable
+}
+
+DE_by_disease <- function(
+    sce, ident.1, ident.2, model = ~ disease, pcut = 0.05, fccut = log2(2)) {
+	
+    disease <- as.factor(sce$disease)
+    disease <- factor(disease,
+        levels = c(ident.1, ident.2,
+                   levels(disease)[!(levels(disease) %in% c(ident.1, ident.2))]))
+    phase <- as.factor(sce$phase)
+    
+    design <- model.matrix(model, data = data.frame(disease = disease, phase = phase))
+    rownames(design) <- colnames(sce)
+    fit <- lmFit(counts(sce), design)
+    fit <- eBayes(fit, robust = T)
+    gtable <- topTable(fit, coef=2, adjust = "BH", number = Inf, sort.by = 'logFC')
+    gtable <- gtable[gtable$adj.P.Val<pcut,]
+    gtable <- gtable[abs(gtable$logFC) > fccut,]
+    
+    gtable
+}
+```
+
+1. DGE on disease/stage with limma
+
+```{r fig2}
+## Perform DE without trimming
+DvC_gene <- DE_by_disease(ALL, "Disease", "Control", fccut = -Inf, pcut = Inf)
+# Phase stratifications
+DvC_gene_PE <- DE_by_disease(ALL[,ALL$phase=="PE"], "Disease", "Control", fccut = -Inf, pcut = Inf)
+DvC_gene_ESE <- DE_by_disease(ALL[,ALL$phase=="ESE"], "Disease", "Control", fccut = -Inf, pcut = Inf)
+DvC_gene_MSE <- DE_by_disease(ALL[,ALL$phase=="MSE"], "Disease", "Control", fccut = -Inf, pcut = Inf)
+# Stage stratifications 
+InIIvC_gene <- DE_per_stage(ALL, "I-II", "control", fccut = -Inf, pcut = Inf)
+IIInIVvC_gene <- DE_per_stage(ALL, "III-IV", "control", fccut = -Inf, pcut = Inf)
+
+## Perform DE with trimming
+DvC_gene_sig <- DE_by_disease(ALL, "Disease", "Control")
+# Phase stratifications
+DvC_gene_PE_sig <- DE_by_disease(ALL[,ALL$phase=="PE"], "Disease", "Control")
+DvC_gene_ESE_sig <- DE_by_disease(ALL[,ALL$phase=="ESE"], "Disease", "Control")
+DvC_gene_MSE_sig <- DE_by_disease(ALL[,ALL$phase=="MSE"], "Disease", "Control")
+# Stage stratifications 
+InIIvC_gene_sig <- DE_per_stage(ALL, "I-II", "control")
+IIInIVvC_gene_sig <- DE_per_stage(ALL, "III-IV", "control")
+
+# Additionally Stage vs Stage (with trimming)
+PEvESE_gene_InII_sig <- DE_per_phase(ALL[,ALL$stage=="I-II"], "PE", "ESE")
+PEvESE_gene_IIInIV_sig <- DE_per_phase(ALL[,ALL$stage=="III-IV"], "PE", "ESE")
+ESEvMSE_gene_InII_sig <- DE_per_phase(ALL[,ALL$stage=="I-II"], "ESE", "MSE")
+ESEvMSE_gene_IIInIV_sig <- DE_per_phase(ALL[,ALL$stage=="III-IV"], "ESE", "MSE")
+PEvMSE_gene_InII_sig <- DE_per_phase(ALL[,ALL$stage=="I-II"], "PE", "MSE")
+PEvMSE_gene_IIInIV_sig <- DE_per_phase(ALL[,ALL$stage=="III-IV"], "PE", "MSE")
+```
+
+2. GSEA with fgsea, based on DGE per disease/stage
+
+gmt_file was downloaded from https://www.gsea-msigdb.org/gsea/msigdb/collections.jsp#H.
+
+```{r}
+run_fgsea_by_logFC <- function(
+    DEdata, #limma toptable output
+    gmt_file = "refs/h.all.v7.1.symbols.gmt", # Location to the pathways info gmt
+    pcut = 1,
+    name = deparse(substitute(DEdata))) # pvalue to trim to. 1 by default
+    {
+
+    # Obtain pathways
+    gmt <- gmtPathways(gmt_file)
+
+    # Obtain stats as gene_symbols
+    DE_symb <- DEdata[!is.na(rows.to.symbol(DEdata, trim.na = FALSE)),]
+    DE_symb <- DE_symb[order(DE_symb$logFC, decreasing = TRUE),]
+    stats <- DE_symb$logFC
+    names(stats) <- rows.to.symbol(DE_symb)
+
+    # Run fgsea
+    gsea <- fgsea(
+        pathways = gmt,
+        stats = stats,
+        minSize = 15,
+        eps = 0,
+        maxSize = 1500)
+
+    # Trim by pval and output
+    gsea <- gsea[gsea$pval <= pcut,]
+
+    # Add dataset name
+    cbind(gsea, name = name)
+}
+
+set.seed(2009)
+GSEAs <- rbind(
+    All = run_fgsea_by_logFC(DvC_gene, name = "Unstratified"),
+    PE = run_fgsea_by_logFC(DvC_gene_PE, name = "PE Samples"),
+    ESE = run_fgsea_by_logFC(DvC_gene_ESE, name = "ESE Samples"),
+    MSE = run_fgsea_by_logFC(DvC_gene_MSE, name = "MSE Samples"),
+    InII = run_fgsea_by_logFC(InIIvC_gene, name = "Stages I-II"),
+    IIInIV = run_fgsea_by_logFC(IIInIVvC_gene, name = "Stages III-IV"))
+```
+
+3. DGE between phases with limma, stratified by case vs control
+
+```{r}
+## Perform DE without trimming
+PEvESE_gene_disease <- DE_per_phase(ALL[,ALL$disease=="Disease"], "PE", "ESE", fccut = -Inf, pcut = Inf)
+PEvESE_gene_control <- DE_per_phase(ALL[,!ALL$disease=="Disease"], "PE", "ESE", fccut = -Inf, pcut = Inf)
+ESEvMSE_gene_disease <- DE_per_phase(ALL[,ALL$disease=="Disease"], "ESE", "MSE", fccut = -Inf, pcut = Inf)
+ESEvMSE_gene_control <- DE_per_phase(ALL[,!ALL$disease=="Disease"], "ESE", "MSE", fccut = -Inf, pcut = Inf)
+PEvMSE_gene_disease <- DE_per_phase(ALL[,ALL$disease=="Disease"], "PE", "MSE", fccut = -Inf, pcut = Inf)
+PEvMSE_gene_control <- DE_per_phase(ALL[,!ALL$disease=="Disease"], "PE", "MSE", fccut = -Inf, pcut = Inf)
+
+## And with trimming
+PEvESE_gene_disease_sig <- DE_per_phase(ALL[,ALL$disease=="Disease"], "PE", "ESE")
+PEvESE_gene_control_sig <- DE_per_phase(ALL[,!ALL$disease=="Disease"], "PE", "ESE")
+ESEvMSE_gene_disease_sig <- DE_per_phase(ALL[,ALL$disease=="Disease"], "ESE", "MSE")
+ESEvMSE_gene_control_sig <- DE_per_phase(ALL[,!ALL$disease=="Disease"], "ESE", "MSE")
+PEvMSE_gene_disease_sig <- DE_per_phase(ALL[,ALL$disease=="Disease"], "PE", "MSE")
+PEvMSE_gene_control_sig <- DE_per_phase(ALL[,!ALL$disease=="Disease"], "PE", "MSE")
+```
+
+4. Output DGE tables
+
+```{r}
+# Disease/stage vs Control
+write.csv(cbind(DvC_gene_sig, gene_symbol = rows.to.symbol(DvC_gene_sig, FALSE)),
+          file = "tables/DvC_unstrat_geneTable.csv")
+write.csv(cbind(DvC_gene_PE_sig, gene_symbol = rows.to.symbol(DvC_gene_PE_sig, FALSE)),
+          file = "tables/DvC_PEsamples_geneTable.csv")
+write.csv(cbind(DvC_gene_ESE_sig, gene_symbol = rows.to.symbol(DvC_gene_ESE_sig, FALSE)),
+          file = "tables/DvC_ESEsamples_geneTable.csv")
+write.csv(cbind(DvC_gene_MSE_sig, gene_symbol = rows.to.symbol(DvC_gene_MSE_sig, FALSE)),
+          file = "tables/DvC_MSEsamples_geneTable.csv")
+write.csv(cbind(InIIvC_gene_sig, gene_symbol = rows.to.symbol(InIIvC_gene_sig, FALSE)),
+          file = "tables/InIIvC_geneTable.csv")
+write.csv(cbind(IIInIVvC_gene_sig, gene_symbol = rows.to.symbol(IIInIVvC_gene_sig, FALSE)),
+          file = "tables/IIIvIVvC_geneTable.csv")
+
+write.csv(cbind(PEvESE_gene_control_sig, gene_symbol = rows.to.symbol(PEvESE_gene_control_sig, FALSE)),
+          file = "tables/PEvsESE_controls_geneTable.csv")
+write.csv(cbind(PEvESE_gene_disease_sig, gene_symbol = rows.to.symbol(PEvESE_gene_disease_sig, FALSE)),
+          file = "tables/PEvsESE_disease_geneTable.csv")
+write.csv(cbind(PEvESE_gene_InII_sig, gene_symbol = rows.to.symbol(PEvESE_gene_InII_sig, FALSE)),
+          file = "tables/PEvsESE_InIIsamples_geneTable.csv")
+write.csv(cbind(PEvESE_gene_IIInIV_sig, gene_symbol = rows.to.symbol(PEvESE_gene_IIInIV_sig, FALSE)),
+          file = "tables/PEvsESE_IIInIVsamples_geneTable.csv")
+
+write.csv(cbind(PEvMSE_gene_control_sig, gene_symbol = rows.to.symbol(PEvMSE_gene_control_sig, FALSE)),
+          file = "tables/PEvsMSE_controls_geneTable.csv")
+write.csv(cbind(PEvMSE_gene_disease_sig, gene_symbol = rows.to.symbol(PEvMSE_gene_disease_sig, FALSE)),
+          file = "tables/PEvsMSE_disease_geneTable.csv")
+write.csv(cbind(PEvMSE_gene_InII_sig, gene_symbol = rows.to.symbol(PEvMSE_gene_InII_sig, FALSE)),
+          file = "tables/PEvsMSE_InIIsamples_geneTable.csv")
+write.csv(cbind(PEvMSE_gene_IIInIV_sig, gene_symbol = rows.to.symbol(PEvMSE_gene_IIInIV_sig, FALSE)),
+          file = "tables/PEvsMSE_IIInIVsamples_geneTable.csv")
+
+write.csv(cbind(ESEvMSE_gene_control_sig, gene_symbol = rows.to.symbol(ESEvMSE_gene_control_sig, FALSE)),
+          file = "tables/ESEvsMSE_controls_geneTable.csv")
+write.csv(cbind(ESEvMSE_gene_disease_sig, gene_symbol = rows.to.symbol(ESEvMSE_gene_disease_sig, FALSE)),
+          file = "tables/ESEvsMSE_disease_geneTable.csv")
+write.csv(cbind(ESEvMSE_gene_InII_sig, gene_symbol = rows.to.symbol(ESEvMSE_gene_InII_sig, FALSE)),
+          file = "tables/ESEvsMSE_InIIsamples_geneTable.csv")
+write.csv(cbind(ESEvMSE_gene_IIInIV_sig, gene_symbol = rows.to.symbol(ESEvMSE_gene_IIInIV_sig, FALSE)),
+          file = "tables/ESEvsMSE_IIInIVsamples_geneTable.csv")
+```
+
+# 7. Differential Cell Type Enrichment (DCE) Analysis
+
+```{r}
+cell.types.stats <- function(sce, comparator.data, ident.1, ident.2) {
+	# This function:
+	# 1. extracts mean and sd from ident.1 versus ident.2 of the comparator.data metadata of the sce
+	# 2. Runs a wilcox test to determine p values
+	
+	comparator.data <- dittoSeq:::.var_OR_get_meta_or_gene(comparator.data, sce)
+	
+	# Retrieveindices of data of ident 1 and 2, allowing for provision of multiple options.
+	if (length(ident.1)>1) {
+		ident.1 <- paste(ident.1, collapse = "|")
+	}
+	if (length(ident.2)>1) {
+		ident.2 <- paste(ident.2, collapse = "|")
+	}
+	ident.1s <- grepl(ident.1, comparator.data)
+	ident.2s <- grepl(ident.2, comparator.data)
+	
+    df <- matrix(nrow = nrow(sce), ncol=6)
+    mat <- as.matrix(assay(sce,"counts"))
+    for (i in 1:nrow(mat)) {
+    	# Collect data for ident.1 versus ident.2 for each cell type
+        ident1.vec <- unlist(mat[i, ident.1s])
+        ident2.vec <- unlist(mat[i, ident.2s])
+        # Summarize data and calculate p-value.
+        df[i,] <- c(mean(ident1.vec),sd(ident1.vec),
+                    mean(ident2.vec),sd(ident2.vec),
+        			mean(ident1.vec)/mean(ident2.vec),
+                    wilcox.test(ident1.vec,ident2.vec, exact = FALSE)$p.value)
+    }
+    # FDR adjust p-value
+    df <- as.data.frame(df)
+    colnames(df) <- c('mean.1', 'sd.1', 'mean.2', 'sd.2', 'enrichRatio', 'wilcoxon.p.value')
+    df$fdr <- p.adjust(df$wilcoxon.p.value, method = 'fdr')
+    rownames(df) <- rownames(sce)
+    df <- df[order(df$fdr, decreasing = FALSE),]
+    
+    return(df)
+}
+```
+
+1. DCE by disease/stage
+
+```{r}
+## Perform cell type enrichment (no trimming)
+DvC_cell <- cell.types.stats(ALL.cells, "disease", "Disease", "Control")
+# Phase stratifications
+DvC_cell_PE <- cell.types.stats(ALL.cells[,ALL.cells$phase=="PE"], "disease", "Disease", "Control")
+DvC_cell_ESE <- cell.types.stats(ALL.cells[,ALL.cells$phase=="ESE"], "disease", "Disease", "Control")
+DvC_cell_MSE <- cell.types.stats(ALL.cells[,ALL.cells$phase=="MSE"], "disease", "Disease", "Control")
+# Stage stratifications 
+InIIvC_cell <- cell.types.stats(ALL.cells, "stage", "I-II", "control")
+IIInIVvC_cell <- cell.types.stats(ALL.cells, "stage", "III-IV", "control")
+
+## Trim to significant cells, based on FDR
+DvC_cell_sig <- DvC_cell[DvC_cell$fdr<0.05,]
+# Phase stratifications
+DvC_cell_PE_sig <- DvC_cell_PE[DvC_cell_PE$fdr<0.05,]
+DvC_cell_ESE_sig <- DvC_cell_ESE[DvC_cell_ESE$fdr<0.05,]
+DvC_cell_MSE_sig <- DvC_cell_MSE[DvC_cell_MSE$fdr<0.05,]
+# Stage stratifications 
+InIIvC_cell_sig <- InIIvC_cell[InIIvC_cell$fdr<0.05,]
+IIInIVvC_cell_sig <- IIInIVvC_cell[IIInIVvC_cell$fdr<0.05,]
+```
+
+2. DCE between phases, stratified by case vs control
+
+```{r}
+## Perform cell type enrichment (no trimming)
+PEvESE_cell_disease <- cell.types.stats(ALL.cells[,ALL$disease=="Disease"], "phase", "PE", "ESE")
+PEvESE_cell_control <- cell.types.stats(ALL.cells[,!ALL$disease=="Disease"], "phase", "PE", "ESE")
+ESEvMSE_cell_disease <- cell.types.stats(ALL.cells[,ALL$disease=="Disease"], "phase", "ESE", "MSE")
+ESEvMSE_cell_control <- cell.types.stats(ALL.cells[,!ALL$disease=="Disease"], "phase", "ESE", "MSE")
+PEvMSE_cell_disease <- cell.types.stats(ALL.cells[,ALL$disease=="Disease"], "phase", "PE", "MSE")
+PEvMSE_cell_control <- cell.types.stats(ALL.cells[,!ALL$disease=="Disease"], "phase", "PE", "MSE")
+
+## Trim to significant cells, based on FDR
+PEvESE_cell_disease_sig <- PEvESE_cell_disease[PEvESE_cell_disease$fdr < 0.05,]
+PEvESE_cell_control_sig <- PEvESE_cell_control[PEvESE_cell_control$fdr < 0.05,]
+PEvMSE_cell_disease_sig <- PEvMSE_cell_disease[PEvMSE_cell_disease$fdr < 0.05,]
+PEvMSE_cell_control_sig <- PEvMSE_cell_control[PEvMSE_cell_control$fdr < 0.05,]
+ESEvMSE_cell_disease_sig <- ESEvMSE_cell_disease[ESEvMSE_cell_disease$fdr < 0.05,]
+ESEvMSE_cell_control_sig <- ESEvMSE_cell_control[ESEvMSE_cell_control$fdr < 0.05,]
+```
